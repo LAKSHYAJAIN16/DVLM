@@ -47,13 +47,15 @@ round trip per hop and comes in M3.
 
 ## Roadmap
 
+Status: M0–M2 are done. M3 is partly done: replay failover, TTL expiry of dead servers and
+automatic span placement all work.
+
 - **M0: Research and design** (this document).
 - **M1: Correct sharding, single process.** Split the model into client / encoder / decoder
   spans in memory, and test that the result matches the reference model token for token.
 - **M2: Networked swarm on localhost.** Registry, encoder server, span server, transport,
   routing, and a CLI to launch N workers. The same equivalence test runs across processes.
-- **M3: Robustness.** Failover and replay, server-to-server forwarding, a heartbeat that
-  expires dead servers, and rebalancing.
+- **M3: Robustness.** ~~Failover and replay~~ (done), ~~heartbeat and expiry~~ (done), server-to-server forwarding, and rebalancing.
 - **M4: Throughput.** Batching across sessions and micro-batching, an encoder output cache,
   and prefix-cache-aware routing.
 - **M5: Latency.** Speculative decoding (the client drafts, the swarm verifies) and opt-in
