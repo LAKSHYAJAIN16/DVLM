@@ -1,4 +1,6 @@
-"""Command line: `dvlm registry | serve | generate | status | demo | make-tiny`."""
+"""Command line: `dvlm registry | serve | generate | status | demo | make-tiny`.
+
+Roles: `span` (VLM decoder layers), `encoder` (vision / observation encoder), `rssm` (DreamerV3 dynamics)."""
 
 from __future__ import annotations
 
@@ -24,6 +26,10 @@ def build_worker(ckpt: Checkpoint, role: str, start: int = 0, end: int = 0, dtyp
     adapter = get_adapter(ckpt.config)
     if role == "encoder":
         return EncoderWorker(adapter.build_encoder(ckpt, dtype))
+    if role == "rssm":
+        from .dreamer.server import RSSMWorker
+
+        return RSSMWorker(adapter.build_rssm(ckpt, dtype))
     return SpanWorker(adapter.build_span(ckpt, start, end, dtype))
 
 
@@ -31,7 +37,7 @@ async def start_server(
     ckpt: Checkpoint, model: str, registry: str, role: str, start: int = 0, end: int = 0, dtype=torch.float32, **kw
 ) -> Server:
     worker = build_worker(ckpt, role, start, end, dtype)
-    throughput = worker.measure_throughput() if role == "span" else 1.0
+    throughput = worker.measure_throughput() if role in ("span", "rssm") else 1.0
     server = Server(worker, model, registry, throughput=throughput, **kw)
     await server.start()
     return server
@@ -67,7 +73,7 @@ async def cmd_serve(args):
         ckpt, model, args.registry, args.role, start, end, DTYPES[args.dtype],
         host=args.host, port=args.port, public_host=args.public_host,
     )
-    what = f"layers [{start}, {end})" if args.role == "span" else "vision encoder"
+    what = {"span": f"layers [{start}, {end})", "encoder": "encoder", "rssm": "RSSM dynamics"}[args.role]
     print(f"serving {model} {what} at {server.info.address} (peer {server.info.peer_id})", flush=True)
     try:
         await _forever()
@@ -121,7 +127,7 @@ async def cmd_generate(args):
 
 async def cmd_status(args):
     swarm = Swarm(args.registry, args.model_name)
-    for kind in ("encoder", "span"):
+    for kind in ("encoder", "span", "rssm"):
         servers = sorted(await swarm.servers(kind), key=lambda s: (s.model, s.start))
         print(f"{kind} servers: {len(servers)}")
         for s in servers:
@@ -135,6 +141,9 @@ async def cmd_demo(args):
     import tempfile
 
     from .tiny import make_tiny_smolvlm
+
+    if args.arch == "dreamerv3":
+        return await demo_dreamer(args)
 
     path = args.model or str(make_tiny_smolvlm(tempfile.mkdtemp(prefix="dvlm-tiny-")))
     ckpt = Checkpoint(path)
@@ -159,10 +168,50 @@ async def cmd_demo(args):
         await reg.stop()
 
 
-def cmd_make_tiny(args):
-    from .tiny import make_tiny_smolvlm
+async def demo_dreamer(args):
+    """Registry + encoders + RSSM servers; run a policy on a batch of synthetic episodes and dream ahead."""
+    import tempfile
 
-    print(make_tiny_smolvlm(args.out, num_layers=args.layers))
+    from .dreamer.client import DistributedDreamer
+    from .tiny import make_tiny_dreamer
+
+    path = args.model or str(make_tiny_dreamer(tempfile.mkdtemp(prefix="dvlm-dreamer-")))
+    ckpt = Checkpoint(path)
+    model = default_model_name(path)
+    reg = RegistryServer()
+    await reg.start()
+    servers = [await start_server(ckpt, model, reg.address, "encoder") for _ in range(args.encoders)]
+    servers += [await start_server(ckpt, model, reg.address, "rssm") for _ in range(args.rssm)]
+    print(f"swarm up: registry {reg.address}, {args.encoders} encoder(s), {args.rssm} rssm server(s)")
+    agent = DistributedDreamer.from_checkpoint(path, reg.address, model)
+    policy = agent.policy(batch_size=args.batch, seed=args.seed or 0)
+    gen = torch.Generator().manual_seed(0)
+    try:
+        t0 = time.perf_counter()
+        for _ in range(args.steps):
+            obs = torch.randint(0, 256, (args.batch, *ckpt.config.obs_shape), dtype=torch.uint8, generator=gen)
+            action = await policy.act(obs)
+        dt = time.perf_counter() - t0
+        print(f"acted {args.steps} steps x {args.batch} envs in {dt:.2f}s ({args.steps * args.batch / dt:.0f} env-steps/s)")
+        print("last actions:", action.argmax(-1).tolist() if ckpt.config.discrete_actions else action.tolist())
+        dream = await policy.imagine(args.horizon)
+        print(f"imagined {args.horizon} steps: predicted return per env",
+              [round(x, 3) for x in dream["rewards"].sum(0).tolist()])
+        await policy.close()
+    finally:
+        await agent.close()
+        for s in servers:
+            await s.stop()
+        await reg.stop()
+
+
+def cmd_make_tiny(args):
+    from .tiny import make_tiny_dreamer, make_tiny_smolvlm
+
+    if args.arch == "dreamerv3":
+        print(make_tiny_dreamer(args.out))
+    else:
+        print(make_tiny_smolvlm(args.out, num_layers=args.layers))
 
 
 # ---------------------------------------------------------------- parser
@@ -194,7 +243,7 @@ def main(argv=None):
     p.add_argument("--model", required=True, help="local checkpoint dir or HF Hub repo id")
     p.add_argument("--model-name", help="swarm-wide model name (default: dir name / repo id)")
     p.add_argument("--registry", required=True)
-    p.add_argument("--role", choices=["span", "encoder"], default="span")
+    p.add_argument("--role", choices=["span", "encoder", "rssm"], default="span")
     p.add_argument("--layers", help="START:END; default: pick the least-served window automatically")
     p.add_argument("--num-layers", type=int, help="window size when choosing automatically")
     p.add_argument("--host", default="0.0.0.0")
@@ -216,11 +265,17 @@ def main(argv=None):
     p.add_argument("--model", help="checkpoint (default: a tiny random SmolVLM)")
     p.add_argument("--encoders", type=int, default=2)
     p.add_argument("--spans", type=int, default=3)
+    p.add_argument("--arch", choices=["smolvlm", "dreamerv3"], default="smolvlm")
+    p.add_argument("--rssm", type=int, default=2, help="dreamerv3: number of RSSM servers")
+    p.add_argument("--batch", type=int, default=8, help="dreamerv3: parallel environments")
+    p.add_argument("--steps", type=int, default=20, help="dreamerv3: environment steps")
+    p.add_argument("--horizon", type=int, default=15, help="dreamerv3: imagination horizon")
     _add_generate_args(p)
     p.set_defaults(prompt=None)
 
     p = sub.add_parser("make-tiny", help="write a tiny random SmolVLM checkpoint")
     p.add_argument("out")
+    p.add_argument("--arch", choices=["smolvlm", "dreamerv3"], default="smolvlm")
     p.add_argument("--layers", type=int, default=6)
 
     args = parser.parse_args(argv)

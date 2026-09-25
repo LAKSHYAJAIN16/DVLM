@@ -24,7 +24,7 @@ class Checkpoint:
     def __init__(self, path_or_repo: str):
         self.source = str(path_or_repo)
         self._local = Path(path_or_repo) if Path(path_or_repo).is_dir() else None
-        self.config = AutoConfig.from_pretrained(self.source)
+        self.config = self._read_config()
         self.weight_map = self._read_weight_map()
 
     def _file(self, name: str) -> Path:
@@ -33,6 +33,14 @@ class Checkpoint:
         from huggingface_hub import hf_hub_download
 
         return Path(hf_hub_download(self.source, name))
+
+    def _read_config(self):
+        raw = json.loads(self._file("config.json").read_text())
+        if raw.get("model_type") == "dreamerv3":
+            from .dreamer.model import DreamerConfig
+
+            return DreamerConfig.from_dict(raw)
+        return AutoConfig.from_pretrained(self.source)
 
     def _read_weight_map(self) -> dict[str, str]:
         try:

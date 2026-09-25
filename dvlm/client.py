@@ -50,6 +50,21 @@ class Swarm:
         await self.pool.close()
 
 
+async def encode_on_pool(
+    swarm: Swarm, encoders: list[ServerInfo], inputs: torch.Tensor, mask: torch.Tensor | None, offset: int = 0
+) -> torch.Tensor:
+    """Encode on encoders[offset], falling through to the next encoder on failure."""
+    last_err = None
+    for i in range(len(encoders)):
+        enc = encoders[(offset + i) % len(encoders)]
+        try:
+            return await swarm.call(enc.address, "encode", pixel_values=inputs, pixel_attention_mask=mask)
+        except PEER_FAILURES as e:
+            log.warning("encoder %s failed: %r", enc.address, e)
+            last_err = e
+    raise NoRouteError("all encoder servers failed") from last_err
+
+
 class HopFailed(Exception):
     def __init__(self, hop: Hop, cause: Exception):
         super().__init__(f"{hop.address} [{hop.start}, {hop.end}) failed: {cause!r}")
@@ -198,7 +213,13 @@ class DistributedVLM:
                 raise NoRouteError("no encoder servers available")
             # Round-robin images over encoders; each image retries on the next encoder if one fails.
             results = await asyncio.gather(
-                *(self._encode_one(pixel_values[:, j : j + 1], masks[j], encoders, offset=k) for k, j in enumerate(missing))
+                *(
+                    encode_on_pool(
+                        self.swarm, encoders, pixel_values[:, j : j + 1],
+                        None if masks[j] is None else masks[j][None, None], offset=k,
+                    )
+                    for k, j in enumerate(missing)
+                )
             )
             for j, emb in zip(missing, results):
                 self._encoder_cache[keys[j]] = emb
@@ -207,20 +228,6 @@ class DistributedVLM:
         for key in keys:
             self._encoder_cache.move_to_end(key)
         return torch.cat([self._encoder_cache[k] for k in keys], dim=0)
-
-    async def _encode_one(
-        self, pixels: torch.Tensor, mask: torch.Tensor | None, encoders: list[ServerInfo], offset: int
-    ) -> torch.Tensor:
-        mask = None if mask is None else mask[None, None]
-        last_err = None
-        for i in range(len(encoders)):
-            enc = encoders[(offset + i) % len(encoders)]
-            try:
-                return await self.swarm.call(enc.address, "encode", pixel_values=pixels, pixel_attention_mask=mask)
-            except PEER_FAILURES as e:
-                log.warning("encoder %s failed: %r", enc.address, e)
-                last_err = e
-        raise NoRouteError("all encoder servers failed") from last_err
 
     # ---- generation ----
 

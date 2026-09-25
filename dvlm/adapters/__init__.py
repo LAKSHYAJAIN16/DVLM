@@ -1,10 +1,11 @@
 from .base import ModelAdapter
+from ..dreamer.adapter import DreamerAdapter
 from .smolvlm import SmolVLMAdapter
 
-ADAPTERS: list[type[ModelAdapter]] = [SmolVLMAdapter]
+ADAPTERS: list[type] = [SmolVLMAdapter, DreamerAdapter]
 
 
-def get_adapter(config) -> ModelAdapter:
+def get_adapter(config):
     for cls in ADAPTERS:
         if config.model_type in cls.model_types:
             return cls(config)

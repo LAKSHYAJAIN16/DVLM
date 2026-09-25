@@ -50,3 +50,17 @@ def tiny_inputs(n_images: int = 1, image_tokens: int = 4, seed: int = 0) -> tupl
     ids += [11, 12, 13]
     pixel_values = torch.randn(1, n_images, 3, 64, 64, generator=g)
     return torch.tensor([ids]), pixel_values
+
+
+def make_tiny_dreamer(out_dir: str | Path, seed: int = 0, num_actions: int = 4, discrete: bool = True) -> Path:
+    from .dreamer.model import DreamerConfig, DreamerV3
+
+    cfg = DreamerConfig(
+        obs_shape=(3, 32, 32), num_actions=num_actions, discrete_actions=discrete,
+        deter=64, stoch=8, classes=8, hidden=64, cnn_depth=8, mlp_layers=1,
+    )
+    torch.manual_seed(seed)
+    model = DreamerV3(cfg).eval()
+    for p in model.parameters():  # random init leaves LayerNorms at identity; perturb so tests are meaningful
+        p.data.add_(torch.randn_like(p) * 0.1)
+    return model.save(out_dir)
