@@ -10,6 +10,12 @@ Run VLM inference across a swarm of independently owned, heterogeneous machines:
   tokens never leave it. It routes hidden states through the cheapest chain of peers, and
   when a peer dies it **re-routes and replays** that hop's history to the replacements.
 
+**DreamerV3** is also supported as a second model family on the same swarm. The CNN
+observation encoder runs on encoder peers, with a batch of environments split across them. The
+RSSM's recurrent latent state lives on `rssm` peers. The actor, critic, reward and continue
+heads run on the client. All sampling is seeded, so if an RSSM peer dies, replaying the logged
+ops to a replacement reproduces its state exactly.
+
 See [docs/RESEARCH.md](docs/RESEARCH.md) for the state-of-the-art survey and
 [docs/DESIGN.md](docs/DESIGN.md) for the design decisions and roadmap.
 
@@ -34,6 +40,24 @@ dvlm generate --model ./tiny --registry HOST:7700 --input-ids 1,7,8,9,100,100,10
 dvlm generate --model HuggingFaceTB/SmolVLM-256M-Instruct --registry HOST:7700 --image cat.jpg --prompt "What is this?"
 ```
 
+DreamerV3:
+
+```bash
+dvlm demo --arch dreamerv3 --batch 8 --steps 20 --horizon 15
+dvlm make-tiny ./dreamer --arch dreamerv3
+dvlm serve --model ./dreamer --registry HOST:7700 --role encoder
+dvlm serve --model ./dreamer --registry HOST:7700 --role rssm
+```
+
+```python
+from dvlm.dreamer.client import DistributedDreamer
+
+agent = DistributedDreamer.from_checkpoint("./dreamer", "HOST:7700")
+policy = agent.policy(batch_size=8, seed=0)
+action = await policy.act(obs_uint8)          # [B, C, H, W] -> [B, A]
+dream = await policy.imagine(horizon=15)      # features, actions, rewards, continues, values
+```
+
 Use `--public-host` when peers are on different machines. Every node loads only the tensors it
 serves (for Hub checkpoints, only the shards that hold them).
 
@@ -48,6 +72,7 @@ serves (for Hub checkpoints, only the shards that hold them).
 | `dvlm/registry.py` | Soft-state tracker (announce with TTL); can be swapped for a DHT |
 | `dvlm/routing.py` | Dijkstra over layer boundaries (RTT + compute / throughput), automatic span placement |
 | `dvlm/server.py` | `SpanWorker`, `EncoderWorker`, `Server` (RPC + heartbeat) |
+| `dvlm/dreamer/` | DreamerV3 model, adapter, `RSSMWorker`, `Policy` with local/swarm backends and op-log replay failover |
 | `dvlm/client.py` | `DistributedVLM.generate`, `InferenceSession` (replay failover), parallel encoding |
 
 ## Tests
@@ -57,6 +82,9 @@ serves (for Hub checkpoints, only the shards that hold them).
 - Sharded parts vs. the monolithic HF model: exact encoder output, prefill logits for several
   split points, and greedy tokens.
 - The same equivalence across a real localhost TCP swarm.
+- DreamerV3: the swarm matches the in-process model exactly (discrete and continuous actions,
+  mid-batch episode resets, imagination). RSSM failover during observe or imagine replays
+  exactly.
 - Failover: when a node dies, generation re-routes (including onto different layer
   boundaries), survives two failures in a row, fails over between encoders, and reuses the
   encoder cache.

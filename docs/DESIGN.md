@@ -45,6 +45,22 @@ v0 sends each hop's result back to the client, which forwards it to the next hop
 topology). This makes replay trivial. Petals v2-style **server-to-server forwarding** saves one
 round trip per hop and comes in M3.
 
+## DreamerV3 on the swarm
+
+DreamerV3 is a world-model RL agent, not a VLM, but its structure maps onto the same roles:
+
+| Dreamer part | State | Where it runs |
+|---|---|---|
+| CNN observation encoder | none | `encoder` peers; the batch of environments is split across them |
+| RSSM (LayerNorm GRU + categorical latents) | per-episode `(h, z)` | `rssm` peers, one session per environment batch or imagination fork |
+| actor, critic, reward and continue heads | none | client |
+
+The model is small, so it isn't pipeline-sharded by layer. The parallelism comes from splitting
+the components across peers and from running many environments and imagination forks at once.
+All sampling takes seeds derived from `(policy seed, step, stream)`. The client logs each RSSM
+op, and on failure replays the log to another peer, which reproduces the state bit for bit.
+`imagine()` forks the state on the server, so dreaming never changes the acting trajectory.
+
 ## Roadmap
 
 Status: M0–M2 are done. M3 is partly done: replay failover, TTL expiry of dead servers and
